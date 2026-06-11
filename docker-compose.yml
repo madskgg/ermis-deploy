@@ -1,0 +1,240 @@
+services:
+
+  base:
+    build:
+      context: ..
+      dockerfile: ermis-deploy/Dockerfile.base
+    image: ermis-base
+
+
+  # =========================
+  # POSTGRESQL
+  # =========================
+  postgresql:
+    image: postgres:16-alpine
+    container_name: ermis_postgresql
+    environment:
+      POSTGRES_DB: ermis
+      POSTGRES_USER: ermis
+      POSTGRES_PASSWORD: change-me   # keep in sync with DB_PASS in ermis-portal/.env and ermis-ingestion/.env
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ermis -d ermis"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+
+  # =========================
+  # NEO4J
+  # =========================
+  neo4j:
+    image: neo4j:5
+    container_name: ermis_neo4j
+    environment:
+      NEO4J_AUTH: neo4j/change-me    # keep in sync with NEO4J_PASSWORD in ermis-portal/.env and ermis-ingestion/.env
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    expose:
+      - "7474"
+      - "7687"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+
+  # =========================
+  # BACKEND (Django)
+  # =========================
+  backend:
+    build:
+      context: ..
+      dockerfile: ermis-portal/backend/backend/Dockerfile.backend
+
+    container_name: ermis_backend
+
+    env_file:
+      - ../ermis-portal/.env
+
+    volumes:
+      - ../ermis-portal/backend:/app
+      - ../output:/output
+      - ../ermis-common:/ermis-common
+
+    working_dir: /app
+
+    environment:
+      PYTHONPATH: /ermis-common/src
+      # CELERY_BROKER_URL and CELERY_RESULT_BACKEND are set in .env with Redis password
+
+    command: python manage.py runserver 0.0.0.0:8000
+
+    expose:
+      - "8000"
+
+    depends_on:
+      redis:
+        condition: service_started
+      base:
+        condition: service_started
+      postgresql:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+
+  # =========================
+  # CELERY WORKER
+  # =========================
+  celery_worker:
+    build:
+      context: ..
+      dockerfile: ermis-portal/backend/backend/Dockerfile.worker
+
+    container_name: ermis_celery_worker
+
+    env_file:
+      - ../ermis-portal/.env
+
+    volumes:
+      - ../ermis-portal/backend:/app
+      - ../output:/output
+      - hf_cache:/root/.cache/huggingface
+      - ../ermis-common:/ermis-common
+      - ../ermis-ingestion/whitelist.txt:/ermis-ingestion/whitelist.txt:ro
+
+    working_dir: /app
+
+    environment:
+      PYTHONPATH: /ermis-common/src
+      HF_HOME: /root/.cache/huggingface
+      TRANSFORMERS_CACHE: /root/.cache/huggingface
+      ERMIS_WHITELIST_PATH: /ermis-ingestion/whitelist.txt
+      # CELERY_BROKER_URL and CELERY_RESULT_BACKEND are set in .env with Redis password
+
+    command: celery -A backend worker -l info --pool=threads --concurrency=4 --prefetch-multiplier=1
+
+    depends_on:
+      redis:
+        condition: service_started
+      backend:
+        condition: service_started
+      base:
+        condition: service_started
+      postgresql:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+
+  # =========================
+  # REDIS  (password-protected, not exposed to host)
+  # =========================
+  redis:
+    image: redis:7-alpine
+
+    container_name: ermis_redis
+
+    env_file:
+      - ../ermis-portal/.env
+
+    # REDIS_PASSWORD is injected from .env via env_file above.
+    # $$ escapes to a literal $ so the shell inside the container resolves it.
+    command: sh -c "redis-server --requirepass $$REDIS_PASSWORD"
+
+    expose:
+      - "6379"    # reachable only within the Docker network
+
+    restart: unless-stopped
+
+
+  # =========================
+  # FRONTEND
+  # =========================
+  frontend:
+    build:
+      context: ../ermis-portal/frontend
+      dockerfile: Dockerfile
+
+    container_name: ermis_frontend
+
+    expose:
+      - "5173"
+
+    depends_on:
+      - backend
+
+    restart: unless-stopped
+
+
+  # =========================
+  # NGINX
+  # =========================
+  nginx:
+    image: nginx:latest
+
+    container_name: ermis_nginx
+
+    ports:
+      - "8081:80"
+
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf
+
+    depends_on:
+      - backend
+      - frontend
+
+    restart: unless-stopped
+
+
+  # =========================
+  # INGESTION (run on demand, not started by `up -d`)
+  # =========================
+  ingestion:
+    build:
+      context: ..
+      dockerfile: ermis-ingestion/Dockerfile
+
+    container_name: ermis_ingestion
+
+    env_file:
+      - ../ermis-ingestion/.env
+
+    volumes:
+      - ../output:/output
+      - hf_cache:/root/.cache/huggingface
+      - ../ermis-common:/ermis-common
+
+    environment:
+      PYTHONPATH: /ermis-common/src
+      HF_HOME: /root/.cache/huggingface
+      TRANSFORMERS_CACHE: /root/.cache/huggingface
+
+    profiles:
+      - tools
+
+
+# =========================
+# VOLUMES
+# =========================
+volumes:
+  hf_cache:
+  postgres_data:
+  neo4j_data:
+  neo4j_logs:

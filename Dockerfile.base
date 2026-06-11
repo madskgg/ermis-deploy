@@ -1,0 +1,29 @@
+FROM python:3.10.11
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/root/.cache/huggingface \
+    NLTK_DATA=/usr/local/nltk_data
+
+# system deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    git \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# install pip
+RUN pip install --upgrade pip
+
+# copy shared package FIRST (important for cache)
+COPY ermis-common /ermis-common
+
+# install heavy ML deps ONCE
+RUN pip install --no-cache-dir \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    /ermis-common[ml,pdf]
+
+# download nltk ONCE
+RUN python -m nltk.downloader -d /usr/local/nltk_data punkt punkt_tab
